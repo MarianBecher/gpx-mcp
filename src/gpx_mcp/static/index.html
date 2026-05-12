@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>gpx-mcp — route viewer</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --panel-2: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --marker: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font: 14px/1.45 system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+  #app { display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+  #side { background: var(--panel); padding: 16px; overflow-y: auto; border-right: 1px solid #0b1220; }
+  #map { width: 100%; height: 100%; }
+  h1 { font-size: 14px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+  select { width: 100%; padding: 8px; border-radius: 6px; background: var(--panel-2); color: var(--text); border: 1px solid #0b1220; font: inherit; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+  .stat { background: var(--panel-2); padding: 10px; border-radius: 6px; }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat .v { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  .stat .u { font-size: 11px; color: var(--muted); margin-left: 2px; }
+  .section-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin: 20px 0 6px; }
+  #profile { width: 100%; height: 110px; background: var(--panel-2); border-radius: 6px; display: block; }
+  .legend { margin-top: 6px; }
+  .legend-row { display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: center; padding: 4px 0; font-size: 13px; }
+  .legend-row.empty { display: none; }
+  .swatch { width: 14px; height: 4px; border-radius: 2px; }
+  .legend-row .pct { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--panel-2); margin-top: 4px; }
+  .bar > div { height: 100%; }
+  .sim-controls { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
+  .sim-controls button { background: var(--panel-2); color: var(--text); border: 1px solid #0b1220; border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; min-width: 36px; }
+  .sim-controls button:hover { background: #475569; }
+  .sim-controls select { width: auto; padding: 4px 6px; }
+  .sim-controls .label { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  input[type=range].sim-slider { width: 100%; accent-color: var(--accent); }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .notice { font-size: 12px; color: var(--muted); background: rgba(148,163,184,0.08); border: 1px dashed #475569; padding: 8px; border-radius: 6px; margin-top: 8px; }
+  .empty { color: var(--muted); margin-top: 24px; }
+  .maplibregl-ctrl-attrib a { color: #475569 !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <h1>gpx-mcp viewer</h1>
+    <select id="picker"><option>laden …</option></select>
+    <div id="content"><div class="empty">Wähle eine Route.</div></div>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const KLASS = {
+  cycleway: { color: '#22c55e', label: 'Radweg' },
+  road:     { color: '#3b82f6', label: 'Straße' },
+  track:    { color: '#f59e0b', label: 'Schotter / Forstweg' },
+  path:     { color: '#ef4444', label: 'Pfad' },
+  unknown:  { color: '#94a3b8', label: 'unbekannt' },
+};
+const KLASS_ORDER = ['cycleway', 'road', 'track', 'path', 'unknown'];
+const FALLBACK_COLOR = '#f97316';
+
+const PROFILE_W = 308;
+const PROFILE_H = 110;
+const PROFILE_PAD = 6;
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: {
+    version: 8,
+    sources: {
+      osm: {
+        type: 'raster',
+        tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      }
+    },
+    layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+  },
+  center: [11.08, 49.45],
+  zoom: 10
+});
+map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+const fmt = (n, d = 0) => Number(n).toLocaleString('de-DE', { minimumFractionDigits: d, maximumFractionDigits: d });
+const empty = () => ({ type: 'FeatureCollection', features: [] });
+
+function haversineM(lat1, lon1, lat2, lon2) {
+  const R = 6371008.8;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function ensureSources() {
+  if (map.getSource('track-plain')) return;
+  map.addSource('track-plain', { type: 'geojson', data: empty() });
+  map.addSource('track-surface', { type: 'geojson', data: empty() });
+  map.addSource('position', { type: 'geojson', data: empty() });
+
+  map.addLayer({ id: 'track-casing', type: 'line', source: 'track-plain',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#0b1220', 'line-width': 7 } });
+  map.addLayer({ id: 'track-plain-line', type: 'line', source: 'track-plain',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': FALLBACK_COLOR, 'line-width': 4 } });
+
+  map.addLayer({ id: 'track-surface-casing', type: 'line', source: 'track-surface',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#0b1220', 'line-width': 7 } });
+  for (const k of KLASS_ORDER) {
+    map.addLayer({ id: `track-surface-${k}`, type: 'line', source: 'track-surface',
+      filter: ['==', ['get', 'klass'], k],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': KLASS[k].color, 'line-width': 4 } });
+  }
+
+  // Position marker — added last so it sits on top of all track layers.
+  map.addLayer({ id: 'position-outer', type: 'circle', source: 'position',
+    paint: { 'circle-radius': 8, 'circle-color': '#ffffff', 'circle-stroke-color': '#0b1220', 'circle-stroke-width': 1.5 } });
+  map.addLayer({ id: 'position-inner', type: 'circle', source: 'position',
+    paint: { 'circle-radius': 5, 'circle-color': '#ef4444' } });
+}
+
+function setMode(useSurface) {
+  ensureSources();
+  const plainVis = useSurface ? 'none' : 'visible';
+  const surfVis = useSurface ? 'visible' : 'none';
+  map.setLayoutProperty('track-casing', 'visibility', plainVis);
+  map.setLayoutProperty('track-plain-line', 'visibility', plainVis);
+  map.setLayoutProperty('track-surface-casing', 'visibility', surfVis);
+  for (const k of KLASS_ORDER) {
+    map.setLayoutProperty(`track-surface-${k}`, 'visibility', surfVis);
+  }
+}
+
+function fitToBbox(bbox) {
+  if (!bbox) return;
+  map.fitBounds(
+    [[bbox.min_lon, bbox.min_lat], [bbox.max_lon, bbox.max_lat]],
+    { padding: 40, duration: 600 }
+  );
+}
+
+function renderProfile(samples) {
+  if (!samples || !samples.length) return '';
+  const xs = samples.map(s => s.km);
+  const ys = samples.map(s => s.elev_m);
+  const xmin = xs[0], xmax = xs[xs.length - 1];
+  const ymin = Math.min(...ys), ymax = Math.max(...ys);
+  const yrange = Math.max(1, ymax - ymin);
+  const xScale = x => PROFILE_PAD + (PROFILE_W - 2 * PROFILE_PAD) * (x - xmin) / (xmax - xmin || 1);
+  const yScale = y => PROFILE_H - PROFILE_PAD - (PROFILE_H - 2 * PROFILE_PAD) * (y - ymin) / yrange;
+  const path = samples.map((s, i) => `${i === 0 ? 'M' : 'L'} ${xScale(s.km).toFixed(1)} ${yScale(s.elev_m).toFixed(1)}`).join(' ');
+  const area = `${path} L ${xScale(xmax).toFixed(1)} ${PROFILE_H - PROFILE_PAD} L ${xScale(xmin).toFixed(1)} ${PROFILE_H - PROFILE_PAD} Z`;
+  return `
+    <svg id="profile" viewBox="0 0 ${PROFILE_W} ${PROFILE_H}" preserveAspectRatio="none">
+      <path d="${area}" fill="rgba(56,189,248,0.25)" />
+      <path d="${path}" fill="none" stroke="#38bdf8" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />
+      <text x="${PROFILE_PAD}" y="14" fill="#94a3b8" font-size="10">${Math.round(ymax)} m</text>
+      <text x="${PROFILE_PAD}" y="${PROFILE_H - 2}" fill="#94a3b8" font-size="10">${Math.round(ymin)} m</text>
+      <text x="${PROFILE_W - PROFILE_PAD}" y="${PROFILE_H - 2}" text-anchor="end" fill="#94a3b8" font-size="10">${xmax} km</text>
+      <line id="profile-marker" x1="${PROFILE_PAD}" y1="${PROFILE_PAD}" x2="${PROFILE_PAD}" y2="${PROFILE_H - PROFILE_PAD}" stroke="${'#ef4444'}" stroke-width="1.5" />
+    </svg>`;
+}
+
+function renderSurfaceLegend(breakdown) {
+  if (!breakdown) {
+    return `<div class="notice">Keine Surface-Daten — neu erzeugen oder \`reclassify_surface\` aufrufen.</div>`;
+  }
+  const rows = KLASS_ORDER.map(k => {
+    const pct = breakdown[`${k}_pct`] || 0;
+    const cls = pct === 0 ? 'legend-row empty' : 'legend-row';
+    return `<div class="${cls}"><span class="swatch" style="background:${KLASS[k].color}"></span><span>${KLASS[k].label}</span><span class="pct">${fmt(pct, 1)} %</span></div>`;
+  }).join('');
+  const bar = KLASS_ORDER.map(k => {
+    const pct = breakdown[`${k}_pct`] || 0;
+    return pct > 0 ? `<div style="width:${pct}%; background:${KLASS[k].color}"></div>` : '';
+  }).join('');
+  return `<div class="bar">${bar}</div><div class="legend">${rows}</div>`;
+}
+
+// ---------- Simulation -------------------------------------------------
+
+const sim = {
+  coords: [],     // [[lon, lat], ...] full GPX
+  cumDist: [],    // meters parallel to coords
+  totalKm: 0,
+  profile: [],    // [{km, elev_m}, ...]
+  progressKm: 0,
+  speed: 5,
+  playing: false,
+  lastTs: null,
+  rafId: null,
+};
+
+function simReset(coords, profile) {
+  simPause();
+  sim.coords = coords || [];
+  sim.profile = profile || [];
+  sim.cumDist = new Array(sim.coords.length);
+  sim.cumDist[0] = 0;
+  for (let i = 1; i < sim.coords.length; i++) {
+    const [lon1, lat1] = sim.coords[i - 1];
+    const [lon2, lat2] = sim.coords[i];
+    sim.cumDist[i] = sim.cumDist[i - 1] + haversineM(lat1, lon1, lat2, lon2);
+  }
+  sim.totalKm = sim.coords.length ? sim.cumDist[sim.coords.length - 1] / 1000 : 0;
+  sim.progressKm = 0;
+  simRender();
+}
+
+function simPositionAtKm(km) {
+  if (!sim.coords.length) return null;
+  const target = Math.max(0, Math.min(km, sim.totalKm)) * 1000;
+  let lo = 0, hi = sim.cumDist.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sim.cumDist[mid] <= target) lo = mid; else hi = mid;
+  }
+  const d0 = sim.cumDist[lo], d1 = sim.cumDist[hi];
+  const t = d1 > d0 ? (target - d0) / (d1 - d0) : 0;
+  const [lon0, lat0] = sim.coords[lo];
+  const [lon1, lat1] = sim.coords[hi];
+  return [lon0 + t * (lon1 - lon0), lat0 + t * (lat1 - lat0)];
+}
+
+function simElevAtKm(km) {
+  if (!sim.profile.length) return null;
+  if (km <= sim.profile[0].km) return Math.round(sim.profile[0].elev_m);
+  for (let i = 1; i < sim.profile.length; i++) {
+    if (sim.profile[i].km >= km) {
+      const a = sim.profile[i - 1], b = sim.profile[i];
+      const t = (b.km > a.km) ? (km - a.km) / (b.km - a.km) : 0;
+      return Math.round(a.elev_m + t * (b.elev_m - a.elev_m));
+    }
+  }
+  return Math.round(sim.profile[sim.profile.length - 1].elev_m);
+}
+
+function simRender() {
+  const pos = simPositionAtKm(sim.progressKm);
+  const posSrc = map.getSource('position');
+  if (posSrc && pos) {
+    posSrc.setData({ type: 'Feature', geometry: { type: 'Point', coordinates: pos }, properties: {} });
+  } else if (posSrc) {
+    posSrc.setData(empty());
+  }
+
+  const marker = document.getElementById('profile-marker');
+  if (marker && sim.profile.length) {
+    const xmin = sim.profile[0].km;
+    const xmax = sim.profile[sim.profile.length - 1].km;
+    const x = PROFILE_PAD + (PROFILE_W - 2 * PROFILE_PAD) * (sim.progressKm - xmin) / (xmax - xmin || 1);
+    const xs = x.toFixed(1);
+    marker.setAttribute('x1', xs);
+    marker.setAttribute('x2', xs);
+  }
+
+  const slider = document.getElementById('sim-slider');
+  if (slider && sim.totalKm > 0) {
+    const v = Math.round((sim.progressKm / sim.totalKm) * 1000);
+    if (parseInt(slider.value, 10) !== v) slider.value = v;
+  }
+
+  const label = document.getElementById('sim-label');
+  if (label) {
+    const elev = simElevAtKm(sim.progressKm);
+    label.textContent = `${fmt(sim.progressKm, 1)} / ${fmt(sim.totalKm, 1)} km` + (elev !== null ? ` · ${elev} m` : '');
+  }
+}
+
+function simStep(ts) {
+  if (!sim.playing) return;
+  if (sim.lastTs !== null) {
+    const dt = (ts - sim.lastTs) / 1000;
+    sim.progressKm += sim.speed * dt;
+    if (sim.progressKm >= sim.totalKm) {
+      sim.progressKm = sim.totalKm;
+      sim.playing = false;
+      simUpdatePlayButton();
+    }
+    simRender();
+  }
+  sim.lastTs = ts;
+  if (sim.playing) sim.rafId = requestAnimationFrame(simStep);
+}
+
+function simPlay() {
+  if (!sim.totalKm) return;
+  if (sim.progressKm >= sim.totalKm) sim.progressKm = 0;
+  sim.playing = true;
+  sim.lastTs = null;
+  sim.rafId = requestAnimationFrame(simStep);
+  simUpdatePlayButton();
+}
+
+function simPause() {
+  sim.playing = false;
+  if (sim.rafId !== null) { cancelAnimationFrame(sim.rafId); sim.rafId = null; }
+  simUpdatePlayButton();
+}
+
+function simUpdatePlayButton() {
+  const btn = document.getElementById('sim-play');
+  if (btn) btn.textContent = sim.playing ? '⏸' : '▶';
+}
+
+function wireSimControls() {
+  const btn = document.getElementById('sim-play');
+  const slider = document.getElementById('sim-slider');
+  const speedSel = document.getElementById('sim-speed');
+  if (btn) btn.addEventListener('click', () => sim.playing ? simPause() : simPlay());
+  if (slider) slider.addEventListener('input', () => {
+    sim.progressKm = (parseFloat(slider.value) / 1000) * sim.totalKm;
+    if (!sim.playing) simRender(); else simRender();
+  });
+  if (speedSel) speedSel.addEventListener('change', () => { sim.speed = parseFloat(speedSel.value); });
+}
+
+function renderSimControls() {
+  return `
+    <div class="section-title">Simulation</div>
+    <div class="sim-controls">
+      <button id="sim-play" type="button" title="Play / Pause">▶</button>
+      <select id="sim-speed" title="Geschwindigkeit">
+        <option value="2">2 km/s</option>
+        <option value="5" selected>5 km/s</option>
+        <option value="15">15 km/s</option>
+        <option value="50">50 km/s</option>
+      </select>
+      <span class="label" id="sim-label">0,0 / 0,0 km</span>
+    </div>
+    <input type="range" class="sim-slider" id="sim-slider" min="0" max="1000" value="0" step="1" />
+  `;
+}
+
+// ---------- Page wiring -------------------------------------------------
+
+async function loadList() {
+  const res = await fetch('/api/routes');
+  const items = await res.json();
+  const picker = document.getElementById('picker');
+  picker.innerHTML = '';
+  if (!items.length) {
+    picker.innerHTML = '<option>– keine GPX-Dateien gefunden –</option>';
+    return;
+  }
+  for (const it of items) {
+    const opt = document.createElement('option');
+    opt.value = it.name;
+    opt.textContent = (it.has_surface ? '● ' : '○ ') + it.name + `  (${it.size_kb} KB)`;
+    picker.appendChild(opt);
+  }
+  picker.addEventListener('change', () => loadRoute(picker.value));
+  loadRoute(items[0].name);
+}
+
+async function loadRoute(name) {
+  const res = await fetch(`/api/routes/${encodeURIComponent(name)}`);
+  if (!res.ok) return;
+  const data = await res.json();
+  const m = data.metadata;
+  ensureSources();
+
+  const useSurface = !!(data.surface && data.surface.features && data.surface.features.length);
+  if (useSurface) {
+    map.getSource('track-surface').setData(data.surface);
+    map.getSource('track-plain').setData(empty());
+  } else {
+    map.getSource('track-plain').setData({ type: 'FeatureCollection', features: [data.geojson] });
+    map.getSource('track-surface').setData(empty());
+  }
+  setMode(useSurface);
+  fitToBbox(m.bbox);
+
+  document.getElementById('content').innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="k">Distanz</div><div class="v">${fmt(m.distance_km, 1)}<span class="u"> km</span></div></div>
+      <div class="stat"><div class="k">Anstieg</div><div class="v">${fmt(m.ascent_m)}<span class="u"> hm</span></div></div>
+      <div class="stat"><div class="k">Abstieg</div><div class="v">${fmt(m.descent_m)}<span class="u"> hm</span></div></div>
+      <div class="stat"><div class="k">Max. Steigung</div><div class="v">${fmt(m.max_grade_percent, 1)}<span class="u"> %</span></div></div>
+      <div class="stat"><div class="k">Steile Strecke</div><div class="v">${fmt(m.steep_uphill_m)}<span class="u"> m</span></div></div>
+      <div class="stat"><div class="k">Track-Punkte</div><div class="v">${fmt(m.n_points)}</div></div>
+    </div>
+    <div class="section-title">Oberflächen</div>
+    ${renderSurfaceLegend(useSurface ? m.surface_breakdown : null)}
+    <div class="section-title">Höhenprofil</div>
+    ${renderProfile(m.elevation_profile)}
+    ${renderSimControls()}
+    <div class="meta">Datei: ${name}</div>
+  `;
+
+  wireSimControls();
+  simReset(data.geojson.geometry.coordinates, m.elevation_profile);
+}
+
+map.on('load', loadList);
+</script>
+</body>
+</html>
