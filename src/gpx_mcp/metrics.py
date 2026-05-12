@@ -33,6 +33,38 @@ def extract_latlon(gpx_text: str) -> list[tuple[float, float]]:
     return [(p.latitude, p.longitude) for p in _all_points(gpx_text)]
 
 
+def parse_points(gpx_text: str) -> list[gpxpy.gpx.GPXTrackPoint]:
+    """Public alias of the internal point extractor."""
+    return _all_points(gpx_text)
+
+
+def cumulative_distances(pts: list[gpxpy.gpx.GPXTrackPoint]) -> list[float]:
+    """Cumulative haversine distance (m) per trackpoint, starting at 0."""
+    cum = [0.0]
+    for i in range(1, len(pts)):
+        a, b = pts[i - 1], pts[i]
+        cum.append(cum[-1] + haversine_m(a.latitude, a.longitude, b.latitude, b.longitude))
+    return cum
+
+
+def nearest_index(
+    pts: list[gpxpy.gpx.GPXTrackPoint], lat: float, lon: float
+) -> tuple[int, float]:
+    """Index of the closest trackpoint to (lat, lon) and its distance in m.
+
+    Per-point haversine, no segment projection — for BRouter tracks (~30 m spacing)
+    the approximation is < 15 m, far below typical detour tolerances.
+    """
+    best_i = 0
+    best_d = float("inf")
+    for i, p in enumerate(pts):
+        d = haversine_m(lat, lon, p.latitude, p.longitude)
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i, best_d
+
+
 def compute_metrics(gpx_text: str) -> dict:
     """Compute full metric set for a GPX track. Agent-friendly summary, no raw GPX."""
     pts = _all_points(gpx_text)

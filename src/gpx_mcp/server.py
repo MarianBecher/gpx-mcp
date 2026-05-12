@@ -15,11 +15,13 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from . import detour as detour_mod
+from . import duration as duration_mod
 from . import enrich as enrich_mod
 from . import geocode as geocode_mod
 from . import pois as pois_mod
 from . import routing as routing_mod
 from . import state
+from . import stations as stations_mod
 from .gpx_utils import load_gpx as load_gpx_impl
 from .gpx_utils import save_gpx as save_gpx_impl
 
@@ -128,6 +130,86 @@ async def reclassify_surface(path: str) -> dict:
     `<path>.surface.json` next to the GPX. Slow for 200 km routes (~30 s).
     """
     return await enrich_mod.reclassify_gpx(path)
+
+
+@mcp.tool()
+async def find_pois_along_route(
+    route_id: str,
+    category: Literal[
+        "forest",
+        "viewpoint",
+        "cafe",
+        "lake",
+        "peak",
+        "castle",
+        "rest_area",
+        "drinking_water",
+    ],
+    max_detour_m: int = 1000,
+    limit: int = 50,
+) -> list[dict]:
+    """Find POIs within `max_detour_m` of a cached route, sorted by km_position.
+
+    Each POI carries `km_position` (where on the route it sits) and `detour_m`
+    (distance from the nearest trackpoint). Use for "Cafés alle 20 km" or
+    "Wasserstellen entlang der Tour".
+    """
+    return await pois_mod.find_pois_along_route(
+        route_id=route_id, category=category, max_detour_m=max_detour_m, limit=limit
+    )
+
+
+@mcp.tool()
+def estimate_duration(
+    route_id: str,
+    avg_speed_kmh: float = 18.0,
+    break_minutes_per_hour: float = 5.0,
+) -> dict:
+    """Estimate cycling duration for a cached route from its elevation profile.
+
+    `avg_speed_kmh` is the flat-ground cruising speed; bergauf/bergab adjusted
+    nonlinear (piecewise grade table, descent capped at 35–40 km/h).
+    Defaults assume a moderately fit rider on a trekking bike.
+    Returns moving time, total time (with breaks), and effective speed.
+    """
+    return duration_mod.estimate(
+        route_id=route_id,
+        avg_speed_kmh=avg_speed_kmh,
+        break_minutes_per_hour=break_minutes_per_hour,
+    )
+
+
+@mcp.tool()
+async def find_train_stations(
+    lat: float | None = None,
+    lon: float | None = None,
+    route_id: str | None = None,
+    radius_m: int = 10000,
+    max_detour_m: int = 3000,
+    limit: int = 30,
+) -> list[dict]:
+    """Find train stations + halts, either around (lat, lon) or along a route.
+
+    Modes:
+      - Provide `lat` + `lon` (and optional `radius_m`): stations around a point,
+        sorted by distance.
+      - Provide `route_id` (and optional `max_detour_m`): stations along a cached
+        route, sorted by km_position.
+
+    Each station carries a `likely_bike_friendly` soft signal derived from OSM
+    tags (regional halts and S-Bahn stations typically allow bike transport).
+    OSM does not encode train-type bike rules — verify in DB Navigator before
+    booking.
+    """
+    if route_id is not None:
+        return await stations_mod.find_stations_along_route(
+            route_id=route_id, max_detour_m=max_detour_m, limit=limit
+        )
+    if lat is None or lon is None:
+        raise ValueError("Provide either route_id or (lat, lon).")
+    return await stations_mod.find_stations_around(
+        lat=lat, lon=lon, radius_m=radius_m, limit=limit
+    )
 
 
 @mcp.tool()
