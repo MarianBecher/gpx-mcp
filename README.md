@@ -38,8 +38,12 @@ handle. This keeps agent context lean even for 200 km tours.
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv sync
+uv sync                  # MCP server only
+uv sync --extra viewer   # + the web route viewer
 ```
+
+The MCP server is the core of this repo; the web viewer is a bonus and its
+dependencies (`starlette`, `uvicorn`) are gated behind the `viewer` extra.
 
 ## Run as MCP server (stdio)
 
@@ -64,6 +68,8 @@ Saved routes land in `./data/routes/` by default. Override with
 `GPX_MCP_ROUTES_DIR=/your/path`.
 
 ## Run the web viewer
+
+Requires the `viewer` extra (see Setup).
 
 ```sh
 uv run gpx-mcp-web
@@ -115,6 +121,7 @@ src/gpx_mcp/
   state.py         In-memory route cache (handle pattern)
   http.py          Shared async HTTP client
   gpx_utils.py     Disk I/O for GPX + sidecar
-  web.py           Starlette route viewer
-  static/          Web viewer assets
+  viewer/          Bonus: Starlette route viewer (optional dep)
+    web.py
+    static/
 ```

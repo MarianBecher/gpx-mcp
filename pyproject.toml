@@ -10,9 +10,15 @@ dependencies = [
     "pydantic>=2.13.4",
 ]
 
+[project.optional-dependencies]
+viewer = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
+
 [project.scripts]
 gpx-mcp = "gpx_mcp.server:main"
-gpx-mcp-web = "gpx_mcp.web:main"
+gpx-mcp-web = "gpx_mcp.viewer.web:main"
 
 [build-system]
 requires = ["hatchling"]

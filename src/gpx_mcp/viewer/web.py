@@ -15,7 +15,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from .metrics import compute_metrics
+from ..metrics import compute_metrics
 
 STATIC_DIR = Path(__file__).parent / "static"
 ROUTES_DIR = Path(os.environ.get("GPX_MCP_ROUTES_DIR", Path.cwd() / "data" / "routes"))
