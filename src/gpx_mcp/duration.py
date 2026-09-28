@@ -6,7 +6,6 @@ fit rider; the caller can scale via `avg_speed_kmh` (flat-ground speed).
 from __future__ import annotations
 
 from . import state
-from .metrics import cumulative_distances, parse_points
 
 # Descent caps: realistic ceilings on a loaded trekking bike (safety, surface quality).
 _DESCENT_CAP_KMH = 35.0
@@ -58,7 +57,7 @@ def estimate(
     Returns moving/total minutes, human-readable strings, and effective speed.
     """
     cached = state.get(route_id)
-    pts = parse_points(cached.gpx)
+    pts = cached.pts
     if len(pts) < 2:
         return {
             "route_id": route_id,
@@ -74,7 +73,7 @@ def estimate(
             },
         }
 
-    cum = cumulative_distances(pts)
+    cum = cached.cum
     total_m = cum[-1]
 
     moving_seconds = 0.0

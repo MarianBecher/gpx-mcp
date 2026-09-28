@@ -16,6 +16,9 @@ viewer = [
     "uvicorn>=0.30",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
 [project.scripts]
 gpx-mcp = "gpx_mcp.server:main"
 gpx-mcp-web = "gpx_mcp.viewer.web:main"

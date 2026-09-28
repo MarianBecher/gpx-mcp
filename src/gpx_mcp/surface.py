@@ -1,27 +1,43 @@
-"""Surface classification using BRouter CSV output (per-segment way tags)."""
+"""Way classification from OSM tags (BRouter WayTags or Overpass way tags).
+
+Every routed segment gets:
+  klass   cycleway | road | track | path | unknown      (what kind of way)
+  paved   True | False | None                           (from `surface`, else inferred)
+  traffic none | quiet | busy_with_lane | busy          (motor traffic exposure)
+  steps   bool
+  ferry   bool
+"""
 from __future__ import annotations
 
 from typing import Literal
 
-from .http import client
 from .metrics import haversine_m
 
-BROUTER_URL = "https://brouter.de/brouter"
-
 Klass = Literal["cycleway", "road", "track", "path", "unknown"]
-
 ALL_KLASSES: tuple[Klass, ...] = ("cycleway", "road", "track", "path", "unknown")
 
-_ROAD_HIGHWAYS = {
-    "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified",
-    "residential", "living_street", "service", "road",
-    "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
+_BUSY_HIGHWAYS = {
+    "motorway", "trunk", "primary", "secondary",
+    "motorway_link", "trunk_link", "primary_link", "secondary_link",
 }
+_QUIET_HIGHWAYS = {
+    "tertiary", "tertiary_link", "unclassified", "residential", "living_street", "service", "road",
+}
+_ROAD_HIGHWAYS = _BUSY_HIGHWAYS | _QUIET_HIGHWAYS
 
-_PAVED_SURFACES = {"asphalt", "paved", "concrete", "paving_stones", "concrete:plates", "concrete:lanes"}
+_PAVED_SURFACES = {
+    "asphalt", "paved", "concrete", "concrete:plates", "concrete:lanes", "paving_stones",
+    "sett", "cobblestone", "unhewn_cobblestone", "metal", "wood", "chipseal", "bricks",
+}
+_UNPAVED_SURFACES = {
+    "unpaved", "gravel", "fine_gravel", "compacted", "dirt", "earth", "ground", "grass",
+    "sand", "mud", "pebblestone", "woodchips", "rock", "grass_paver", "stepping_stones", "shells",
+}
+_CYCLE_LANE_VALUES = {"lane", "track", "opposite_lane", "opposite_track", "share_busway", "shared_lane"}
 
 
-def _parse_tags(way_tags: str) -> dict[str, str]:
+def parse_tags(way_tags: str) -> dict[str, str]:
+    """`"highway=cycleway surface=asphalt"` → dict."""
     out: dict[str, str] = {}
     for tok in way_tags.split():
         if "=" in tok:
@@ -30,157 +46,230 @@ def _parse_tags(way_tags: str) -> dict[str, str]:
     return out
 
 
-def classify(way_tags: str) -> Klass:
-    """Map a BRouter WayTags string to a surface class."""
-    if not way_tags or way_tags == "-":
-        return "unknown"
-    t = _parse_tags(way_tags)
+def _klass(t: dict[str, str]) -> Klass:
     highway = t.get("highway", "")
-    bicycle = t.get("bicycle", "")
-    surface = t.get("surface", "")
-
     if highway == "cycleway":
         return "cycleway"
-    if bicycle == "designated" and highway in {"path", "footway"}:
+    if t.get("bicycle") == "designated" and highway in {"path", "footway"}:
         return "cycleway"
-    if highway in {"path", "footway", "pedestrian", "steps"}:
+    if highway in {"path", "footway", "pedestrian", "steps", "bridleway"}:
         return "path"
     if highway == "track":
-        return "road" if surface in _PAVED_SURFACES else "track"
+        return "road" if t.get("surface", "") in _PAVED_SURFACES else "track"
     if highway in _ROAD_HIGHWAYS:
         return "road"
     return "unknown"
 
 
-async def fetch_segments(
-    waypoints: list[tuple[float, float]],
-    profile: str,
-    alternative_idx: int,
-) -> list[dict]:
-    """Fetch BRouter CSV and return [{lat, lon, dist_to_prev_m, klass}] per point.
+def _paved(t: dict[str, str], klass: Klass) -> bool | None:
+    surface = t.get("surface", "")
+    if surface:
+        base = surface.split(";")[0].split(":")[0] if surface not in _PAVED_SURFACES else surface
+        if surface in _PAVED_SURFACES or base in _PAVED_SURFACES:
+            return True
+        if surface in _UNPAVED_SURFACES or base in _UNPAVED_SURFACES:
+            return False
+        return None
+    tracktype = t.get("tracktype", "")
+    if tracktype:
+        return tracktype == "grade1"
+    highway = t.get("highway", "")
+    if highway in _ROAD_HIGHWAYS or highway == "cycleway":
+        return True  # roads and cycleways without a surface tag are almost always sealed
+    if highway == "track":
+        return False
+    return None
 
-    First row's klass labels the segment from the snap-start to row 1's coord
-    (small approximation; impact ~10m of a route).
-    """
-    lonlats = "|".join(f"{lon:.6f},{lat:.6f}" for lat, lon in waypoints)
-    params = {
-        "lonlats": lonlats,
-        "profile": profile,
-        "alternativeidx": alternative_idx,
-        "format": "csv",
+
+def _traffic(t: dict[str, str]) -> str:
+    highway = t.get("highway", "")
+    if highway in _BUSY_HIGHWAYS:
+        lane_vals = {
+            t.get("cycleway", ""), t.get("cycleway:both", ""),
+            t.get("cycleway:right", ""), t.get("cycleway:left", ""),
+        }
+        if lane_vals & _CYCLE_LANE_VALUES or t.get("sidewalk:bicycle") == "yes":
+            return "busy_with_lane"
+        return "busy"
+    if highway in _QUIET_HIGHWAYS:
+        return "quiet"
+    return "none"
+
+
+_CYCLE_ROUTE_KEYS = ("route_bicycle_icn", "route_bicycle_ncn", "route_bicycle_rcn", "route_bicycle_lcn")
+
+
+def cycle_route_networks(t: dict[str, str]) -> list[str]:
+    """Signed cycle-route networks this way is part of (BRouter merges relations in)."""
+    return [k.rsplit("_", 1)[1] for k in _CYCLE_ROUTE_KEYS if t.get(k) == "yes"]
+
+
+def classify_tags(t: dict[str, str]) -> dict:
+    """Full classification dict for a tag dict."""
+    if not t:
+        return {"klass": "unknown", "paved": None, "traffic": "none", "steps": False, "ferry": False, "cycle_route": []}
+    klass = _klass(t)
+    return {
+        "klass": klass,
+        "paved": _paved(t, klass),
+        "traffic": _traffic(t),
+        "steps": t.get("highway") == "steps",
+        "ferry": t.get("route") == "ferry",
+        "cycle_route": cycle_route_networks(t),
     }
-    resp = await client().get(BROUTER_URL, params=params)
-    resp.raise_for_status()
-    lines = resp.text.splitlines()
-    if not lines:
+
+
+def classify(way_tags: str) -> Klass:
+    """Coarse class for a BRouter WayTags string (kept for the enrich path)."""
+    if not way_tags or way_tags == "-":
+        return "unknown"
+    return _klass(parse_tags(way_tags))
+
+
+def segments_from_messages(messages: list[list[str]]) -> list[dict]:
+    """BRouter GeoJSON `messages` (header row + rows) → segment dicts.
+
+    Each row describes the way segment ending at (lon, lat), with `Distance`
+    metres from the previous message point. `NodeTags` describe the node at
+    the end of the segment (barriers, crossings, ...).
+    """
+    if not messages:
         return []
-    header = lines[0].split("\t")
+    header = messages[0]
     col = {name: i for i, name in enumerate(header)}
     out: list[dict] = []
-    for raw in lines[1:]:
-        parts = raw.split("\t")
-        if len(parts) < len(header):
+    for row in messages[1:]:
+        if len(row) < len(header):
             continue
-        lon = int(parts[col["Longitude"]]) / 1e6
-        lat = int(parts[col["Latitude"]]) / 1e6
-        dist = int(parts[col["Distance"]]) if parts[col["Distance"]] else 0
-        out.append(
-            {
-                "lat": lat,
-                "lon": lon,
-                "dist_to_prev_m": dist,
-                "klass": classify(parts[col["WayTags"]]),
-            }
-        )
+        tags = parse_tags(row[col["WayTags"]]) if row[col["WayTags"]] not in ("", "-") else {}
+        node_tags = parse_tags(row[col["NodeTags"]]) if col.get("NodeTags") is not None and row[col["NodeTags"]] else {}
+        seg = {
+            "lat": int(row[col["Latitude"]]) / 1e6,
+            "lon": int(row[col["Longitude"]]) / 1e6,
+            "dist_m": int(row[col["Distance"]] or 0),
+            "tags": tags,
+            "node_tags": node_tags,
+        }
+        seg.update(classify_tags(tags))
+        out.append(seg)
     return out
 
 
-def project_to_gpx(
-    csv_segments: list[dict], gpx_points: list[tuple[float, float]]
-) -> list[dict]:
-    """Map each GPX trackpoint to a class via cumulative-distance alignment with CSV.
+def map_points_to_segments(
+    segments: list[dict], gpx_points: list[tuple[float, float]]
+) -> list[int]:
+    """For each GPX trackpoint, the index of the segment it belongs to.
 
-    Reason: BRouter's GPX has ~4x more points than its CSV (full OSM way shape vs
-    routing decision points). Rendering with CSV coords cuts curves; we want the
-    GPX shape with CSV-derived classes.
-
-    Returns: [{lat, lon, klass, dist_to_prev_m}] aligned to gpx_points length.
+    Alignment is by cumulative distance (BRouter's GPX has ~4x more points than
+    message rows); scaled so both chains end together.
     """
-    if not csv_segments or not gpx_points:
+    if not segments or not gpx_points:
         return []
-
-    csv_cum: list[float] = []
+    seg_cum: list[float] = []
     t = 0.0
-    for s in csv_segments:
-        t += float(s.get("dist_to_prev_m", 0))
-        csv_cum.append(t)
-    csv_total = csv_cum[-1]
+    for s in segments:
+        t += float(s["dist_m"])
+        seg_cum.append(t)
+    seg_total = seg_cum[-1]
 
-    gpx_cum: list[float] = [0.0]
+    gpx_cum = [0.0]
     for i in range(1, len(gpx_points)):
         gpx_cum.append(
             gpx_cum[-1]
-            + haversine_m(
-                gpx_points[i - 1][0], gpx_points[i - 1][1],
-                gpx_points[i][0], gpx_points[i][1],
-            )
+            + haversine_m(gpx_points[i - 1][0], gpx_points[i - 1][1], gpx_points[i][0], gpx_points[i][1])
         )
     gpx_total = gpx_cum[-1]
+    if seg_total <= 0 or gpx_total <= 0:
+        return [0] * len(gpx_points)
 
-    if csv_total <= 0 or gpx_total <= 0:
-        return []
-
-    scale = csv_total / gpx_total
-    out: list[dict] = []
+    scale = seg_total / gpx_total
+    out: list[int] = []
     j = 0
-    last_j = len(csv_segments) - 1
-    for i, (lat, lon) in enumerate(gpx_points):
+    last_j = len(segments) - 1
+    for i in range(len(gpx_points)):
         target = gpx_cum[i] * scale
-        while j < last_j and csv_cum[j] < target:
+        while j < last_j and seg_cum[j] < target:
             j += 1
-        seg_dist = gpx_cum[i] - gpx_cum[i - 1] if i > 0 else 0.0
-        out.append(
-            {
-                "lat": lat,
-                "lon": lon,
-                "klass": csv_segments[j]["klass"],
-                "dist_to_prev_m": seg_dist,
-            }
-        )
+        out.append(j)
     return out
 
 
-def group_lines(points: list[dict]) -> list[dict]:
-    """Group consecutive same-class points into LineString-style coord lists.
+def group_lines(gpx_points: list[tuple[float, float]], klasses: list[str]) -> list[dict]:
+    """Consecutive same-class points → [{klass, coords:[[lon,lat],...]}] for the viewer.
 
     Adjacent groups share their boundary point so the rendered line stays continuous.
     """
-    if not points:
+    if not gpx_points:
         return []
     groups: list[dict] = []
-    cur_klass = points[0]["klass"]
-    coords: list[list[float]] = [[points[0]["lon"], points[0]["lat"]]]
-    for p in points[1:]:
-        if p["klass"] != cur_klass:
-            coords.append([p["lon"], p["lat"]])
-            groups.append({"klass": cur_klass, "coords": coords})
-            cur_klass = p["klass"]
-            coords = [[p["lon"], p["lat"]]]
+    cur = klasses[0]
+    coords: list[list[float]] = [[gpx_points[0][1], gpx_points[0][0]]]
+    for (lat, lon), k in zip(gpx_points[1:], klasses[1:]):
+        if k != cur:
+            coords.append([lon, lat])
+            groups.append({"klass": cur, "coords": coords})
+            cur = k
+            coords = [[lon, lat]]
         else:
-            coords.append([p["lon"], p["lat"]])
-    if coords:
-        groups.append({"klass": cur_klass, "coords": coords})
+            coords.append([lon, lat])
+    groups.append({"klass": cur, "coords": coords})
     return groups
 
 
-def breakdown(points: list[dict]) -> dict[str, float]:
-    """Distance share per class in percent (sums to ~100)."""
-    totals: dict[str, float] = {k: 0.0 for k in ALL_KLASSES}
+def breakdown(segments: list[dict]) -> dict:
+    """Distance shares (percent) plus absolute counters for the annoying stuff."""
     total = 0.0
-    for p in points:
-        d = float(p.get("dist_to_prev_m", 0))
-        totals[p["klass"]] += d
+    by_klass = {k: 0.0 for k in ALL_KLASSES}
+    paved = unpaved = surf_unknown = 0.0
+    busy = busy_lane = quiet = 0.0
+    steps_m = ferry_m = 0.0
+    steps_runs = 0
+    prev_steps = False
+    on_route = 0.0
+    by_network = {"icn": 0.0, "ncn": 0.0, "rcn": 0.0, "lcn": 0.0}
+    for s in segments:
+        d = float(s.get("dist_m", 0))
         total += d
-    if total <= 0:
-        return {f"{k}_pct": 0.0 for k in ALL_KLASSES}
-    return {f"{k}_pct": round(totals[k] / total * 100, 1) for k in ALL_KLASSES}
+        nets = s.get("cycle_route") or []
+        if nets:
+            on_route += d
+            for n in nets:
+                by_network[n] += d
+        by_klass[s["klass"]] += d
+        if s["paved"] is True:
+            paved += d
+        elif s["paved"] is False:
+            unpaved += d
+        else:
+            surf_unknown += d
+        if s["traffic"] == "busy":
+            busy += d
+        elif s["traffic"] == "busy_with_lane":
+            busy_lane += d
+        elif s["traffic"] == "quiet":
+            quiet += d
+        if s["steps"]:
+            steps_m += d
+            if not prev_steps:
+                steps_runs += 1
+        prev_steps = s["steps"]
+        if s["ferry"]:
+            ferry_m += d
+
+    def pct(x: float) -> float:
+        return round(x / total * 100, 1) if total > 0 else 0.0
+
+    return {
+        **{f"{k}_pct": pct(v) for k, v in by_klass.items()},
+        "paved_pct": pct(paved),
+        "unpaved_pct": pct(unpaved),
+        "surface_unknown_pct": pct(surf_unknown),
+        "busy_road_pct": pct(busy),
+        "busy_road_with_lane_pct": pct(busy_lane),
+        "quiet_road_pct": pct(quiet),
+        "steps_count": steps_runs,
+        "steps_m": round(steps_m),
+        "ferry_m": round(ferry_m),
+        "signed_cycle_route_pct": pct(on_route),
+        "cycle_route_network_pct": {k: pct(v) for k, v in by_network.items() if v > 0},
+    }

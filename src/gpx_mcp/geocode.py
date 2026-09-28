@@ -2,30 +2,16 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 
 from .http import client
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 _rate_limit_lock = asyncio.Lock()
 _last_call_ts: float = 0.0
 _MIN_INTERVAL_S = 1.05
 
-
-@dataclass
-class GeocodeResult:
-    lat: float
-    lon: float
-    display_name: str
-    type: str
-
-    def as_dict(self) -> dict:
-        return {
-            "lat": self.lat,
-            "lon": self.lon,
-            "display_name": self.display_name,
-            "type": self.type,
-        }
+_PLACE_KEYS = ("village", "hamlet", "suburb", "town", "city", "municipality", "county")
 
 
 async def _throttle() -> None:
@@ -40,13 +26,7 @@ async def _throttle() -> None:
 
 
 async def geocode(query: str, limit: int = 3, country_codes: str | None = "de") -> list[dict]:
-    """Resolve a place name to coordinates.
-
-    Args:
-        query: free-text place name, e.g. "Nürnberg" or "Feucht, Bayern".
-        limit: max results (1–10).
-        country_codes: ISO 3166-1 alpha-2 comma list to restrict; None = worldwide.
-    """
+    """Resolve a place name to coordinates."""
     await _throttle()
     params: dict[str, str | int] = {
         "q": query,
@@ -56,16 +36,37 @@ async def geocode(query: str, limit: int = 3, country_codes: str | None = "de") 
     }
     if country_codes:
         params["countrycodes"] = country_codes
-
-    resp = await client().get(NOMINATIM_URL, params=params)
+    resp = await client().get(NOMINATIM_SEARCH, params=params)
     resp.raise_for_status()
-    raw = resp.json()
     return [
-        GeocodeResult(
-            lat=float(r["lat"]),
-            lon=float(r["lon"]),
-            display_name=r["display_name"],
-            type=r.get("type", ""),
-        ).as_dict()
-        for r in raw
+        {
+            "lat": float(r["lat"]),
+            "lon": float(r["lon"]),
+            "display_name": r["display_name"],
+            "type": r.get("type", ""),
+        }
+        for r in resp.json()
     ]
+
+
+async def reverse(lat: float, lon: float, zoom: int = 16) -> dict:
+    """Coordinates → nearest address. zoom 16 ≈ street, 14 ≈ suburb, 10 ≈ city."""
+    await _throttle()
+    params: dict[str, str | int | float] = {
+        "lat": lat, "lon": lon, "format": "jsonv2", "zoom": max(3, min(zoom, 18)), "addressdetails": 1,
+    }
+    resp = await client().get(NOMINATIM_REVERSE, params=params)
+    resp.raise_for_status()
+    r = resp.json()
+    addr = r.get("address", {})
+    place = next((addr[k] for k in _PLACE_KEYS if k in addr), None)
+    return {
+        "lat": lat,
+        "lon": lon,
+        "display_name": r.get("display_name"),
+        "road": addr.get("road") or addr.get("pedestrian") or addr.get("cycleway") or addr.get("path"),
+        "place": place,
+        "postcode": addr.get("postcode"),
+        "state": addr.get("state"),
+        "type": r.get("type"),
+    }
