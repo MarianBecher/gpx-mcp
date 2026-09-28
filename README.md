@@ -1,5 +1,7 @@
 # gpx-mcp
 
+[![Built with Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-d97757)](https://claude.com/claude-code)
+
 MCP server for planning bike routes. Wraps **BRouter**, **Nominatim**, and the
 **Overpass API** so a Claude (or other MCP client) can geocode places, compute
 GPX tracks, find POIs and train stations, classify surface coverage, and
@@ -125,3 +127,9 @@ src/gpx_mcp/
     web.py
     static/
 ```
+
+## How this was made
+
+The code, tests and docs were written by Claude (Anthropic) with Claude
+Code, directed and reviewed by me. The tools are covered by the test suite in
+`tests/`.
